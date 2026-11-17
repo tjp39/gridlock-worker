@@ -25,6 +25,7 @@ import io
 import os
 import re
 import sys
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -56,7 +57,14 @@ def list_latest_files(n: int) -> list[str]:
 
 
 def download_csv_text(filename: str) -> str:
-    r = session.get(NEMWEB_DIR + filename, timeout=60)
+    # NEMweb rate-limits bursts of downloads with 403/429; back off and retry.
+    for wait in (0, 5, 15, 30, 60):
+        if wait:
+            time.sleep(wait)
+        r = session.get(NEMWEB_DIR + filename, timeout=60)
+        if r.status_code not in (403, 429, 503):
+            break
+        print(f"  … NEMweb throttled ({r.status_code}), retrying {filename} in a moment")
     r.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         inner = zf.namelist()[0]
@@ -173,7 +181,10 @@ def build_constraints(t: dict) -> list[dict]:
 def upsert(table: str, rows: list[dict], conflict_cols: str):
     if not rows:
         return
-    url = os.environ["SUPABASE_URL"].rstrip("/") + f"/rest/v1/{table}?on_conflict={conflict_cols}"
+    base = os.environ["SUPABASE_URL"].strip().rstrip("/")
+    if base.endswith("/rest/v1"):          # accept either form of the URL
+        base = base[: -len("/rest/v1")]
+    url = base + f"/rest/v1/{table}?on_conflict={conflict_cols}"
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
     headers = {
         "apikey": key,
@@ -212,7 +223,9 @@ def main():
     print(f"Processing {len(files)} file(s): {files[0] if files else '-'} … {files[-1] if files else '-'}")
 
     all_p, all_i, all_c = [], [], []
-    for f in files:
+    for n, f in enumerate(files):
+        if n:
+            time.sleep(0.3)  # be polite to NEMweb on big backfills
         try:
             p, i, c = process_text(download_csv_text(f))
         except Exception as e:  # one bad file shouldn't kill the run
