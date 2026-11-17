@@ -16,7 +16,7 @@ Usage:
 
 Env vars (put in a .env file locally, GitHub Secrets in Actions):
   SUPABASE_URL               e.g. https://abcd1234.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY  Supabase -> Project Settings -> API -> service_role (keep secret!)
+  SUPABASE_SERVICE_ROLE_KEY  Supabase -> Project Settings -> API Keys -> Secret key (sb_secret_...), keep secret!
 """
 
 import argparse
@@ -177,10 +177,13 @@ def upsert(table: str, rows: list[dict], conflict_cols: str):
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
     headers = {
         "apikey": key,
-        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal",
     }
+    # Legacy keys are JWTs (start with "eyJ") and also go in the Authorization header.
+    # New sb_secret_ keys are not JWTs and must only be sent as "apikey".
+    if key.startswith("eyJ"):
+        headers["Authorization"] = f"Bearer {key}"
     for i in range(0, len(rows), 500):
         r = requests.post(url, json=rows[i:i + 500], headers=headers, timeout=60)
         if r.status_code >= 300:
