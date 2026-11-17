@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+import spikes
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -178,23 +180,46 @@ def build_constraints(t: dict) -> list[dict]:
 
 # ---------------------------------------------------------------- Supabase
 
-def upsert(table: str, rows: list[dict], conflict_cols: str):
-    if not rows:
-        return
+def _sb_base() -> str:
     base = os.environ["SUPABASE_URL"].strip().rstrip("/")
     if base.endswith("/rest/v1"):          # accept either form of the URL
         base = base[: -len("/rest/v1")]
-    url = base + f"/rest/v1/{table}?on_conflict={conflict_cols}"
+    return base + "/rest/v1"
+
+
+def _sb_headers() -> dict:
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
-    headers = {
-        "apikey": key,
-        "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates,return=minimal",
-    }
+    headers = {"apikey": key, "Content-Type": "application/json"}
     # Legacy keys are JWTs (start with "eyJ") and also go in the Authorization header.
     # New sb_secret_ keys are not JWTs and must only be sent as "apikey".
     if key.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def existing_spike_keys(since_iso: str) -> set[tuple[str, str]]:
+    """(interval_end, region) pairs already in the spikes table, so we never re-explain (or re-pay for) a spike."""
+    r = requests.get(
+        f"{_sb_base()}/spikes",
+        params={"select": "interval_end,region", "interval_end": f"gte.{since_iso}"},
+        headers=_sb_headers(), timeout=60,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Supabase read from spikes failed ({r.status_code}): {r.text[:500]}")
+    # Supabase returns timestamps in UTC; normalise both sides to compare
+    return {(datetime.fromisoformat(x["interval_end"]).astimezone(timezone.utc).isoformat(), x["region"])
+            for x in r.json()}
+
+
+def _utc(iso: str) -> str:
+    return datetime.fromisoformat(iso).astimezone(timezone.utc).isoformat()
+
+
+def upsert(table: str, rows: list[dict], conflict_cols: str):
+    if not rows:
+        return
+    url = f"{_sb_base()}/{table}?on_conflict={conflict_cols}"
+    headers = {**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
     for i in range(0, len(rows), 500):
         r = requests.post(url, json=rows[i:i + 500], headers=headers, timeout=60)
         if r.status_code >= 300:
@@ -235,16 +260,30 @@ def main():
 
     print(f"Parsed {len(all_p)} price rows, {len(all_i)} interconnector rows, {len(all_c)} binding constraints")
 
+    found = spikes.detect_spikes(all_p)
+    print(f"Spikes ≥ ${spikes.threshold():,.0f}/MWh in this batch: {len(found)}")
+
     if args.dry_run:
         latest = sorted(all_p, key=lambda r: r["interval_end"])[-5:]
         for r in latest:
             print(f"  {r['interval_end']}  {r['region']:5}  ${r['rrp']:>10,.2f}/MWh  demand {r['total_demand']:>8,.0f} MW")
+        for row in spikes.explain_new_spikes(found[-3:], all_p, all_i, all_c):
+            print(f"\n  [{row['explanation_source']}] {row['interval_end']} {row['region']}:\n  {row['explanation']}")
         return
 
     upsert("prices", all_p, "interval_end,region")
     upsert("interconnectors", all_i, "interval_end,interconnector_id")
     upsert("binding_constraints", all_c, "interval_end,constraint_id")
-    print("Upserted to Supabase ✔")
+    print("Upserted market data to Supabase ✔")
+
+    if found:
+        since = min(s["interval_end"] for s in found)
+        done = existing_spike_keys(since)
+        new = [s for s in found if (_utc(s["interval_end"]), s["region"]) not in done]
+        rows = spikes.explain_new_spikes(new, all_p, all_i, all_c)
+        upsert("spikes", rows, "interval_end,region")
+        n_ai = sum(r["explanation_source"] == "claude" for r in rows)
+        print(f"Explained {len(rows)} new spike(s) ({n_ai} by Claude, {len(rows) - n_ai} by template) ✔")
 
 
 if __name__ == "__main__":
