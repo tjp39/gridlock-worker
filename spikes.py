@@ -78,10 +78,12 @@ def build_facts(spike: dict, prices: list[dict], ics: list[dict], cons: list[dic
             continue
         regs = IC_REGIONS.get(ic["interconnector_id"])
         touches = regs is not None and region in regs
-        at_limit = _ic_at_limit(ic)
-        if not (touches or at_limit):
-            continue
         flow = ic.get("mw_flow") or 0
+        zeroed = _ic_at_limit(ic) and abs(flow) < 5
+        at_limit = _ic_at_limit(ic) and not zeroed
+        # only interconnectors that touch this region matter for its price
+        if not touches:
+            continue
         if regs:
             direction = f"{REGION_NAMES[regs[0]]}→{REGION_NAMES[regs[1]]}" if flow >= 0 \
                 else f"{REGION_NAMES[regs[1]]}→{REGION_NAMES[regs[0]]}"
@@ -95,7 +97,7 @@ def build_facts(spike: dict, prices: list[dict], ics: list[dict], cons: list[dic
             "direction": direction,
             "flowing_into_spike_region": into_region,
             "at_limit": at_limit,
-            "held_at_zero_by_constraint": at_limit and abs(flow) < 5,  # e.g. outage constraints like SVML_ZERO
+            "held_at_zero_by_constraint": zeroed,  # e.g. outage constraints like SVML_ZERO
             "touches_spike_region": touches,
         })
 
@@ -144,9 +146,8 @@ def template_explanation(f: dict) -> str:
         if f["spare_capacity_mw"] is not None:
             d += f", with {f['spare_capacity_mw']:,} MW of spare available generation"
         s.append(d + ".")
-    rel = [ic for ic in f["interconnectors"] if ic["at_limit"] and ic["touches_spike_region"]]
-    limited = [ic for ic in rel if not ic["held_at_zero_by_constraint"]]
-    zeroed = [ic for ic in rel if ic["held_at_zero_by_constraint"]]
+    limited = [ic for ic in f["interconnectors"] if ic["at_limit"]]
+    zeroed = [ic for ic in f["interconnectors"] if ic["held_at_zero_by_constraint"]]
     if limited:
         parts = [f"{ic['name']} ({ic['flow_mw']} MW {ic['direction']})" for ic in limited]
         s.append("Interconnectors at their limit: " + "; ".join(parts) + ".")
@@ -158,18 +159,89 @@ def template_explanation(f: dict) -> str:
     return " ".join(s)
 
 
+REGION_FULL = {"NSW": "New South Wales", "QLD": "Queensland", "VIC": "Victoria",
+               "SA": "South Australia", "TAS": "Tasmania"}
+TYPICAL_PRICE = 100  # $/MWh, a rough "normal" wholesale price used to give readers a sense of scale
+
+
+def plain_template_explanation(f: dict) -> str:
+    """Plain-English version for anyone: no codes, no acronyms, no jargon."""
+    region = REGION_FULL.get(f.get("region"), f.get("region", "the region"))
+    price = f.get("price_per_mwh") or 0
+    s = f"Wholesale power prices in {region} jumped to ${price:,.0f} per megawatt hour"
+    times = price / TYPICAL_PRICE
+    if times >= 3:
+        s += f", roughly {times:,.0f} times a typical price"
+    reasons = []
+
+    def neighbour(ic):
+        d = ic.get("direction") or ""
+        parts = [p for p in d.split("→") if p and p != f["region"]]
+        return REGION_FULL.get(parts[0], parts[0]) if parts else "a neighbouring state"
+
+    ics = f.get("interconnectors") or []
+    full_in = [ic for ic in ics if ic.get("at_limit") and ic.get("flowing_into_spike_region")]
+    if full_in:
+        names = sorted({neighbour(ic) for ic in full_in})
+        reasons.append(f"the power lines bringing electricity in from {' and '.join(names)} were already full, "
+                       f"so the state couldn't import more cheaper power")
+    if any(ic.get("held_at_zero_by_constraint") for ic in ics):
+        reasons.append("one of its power links to a neighbouring state was out of action")
+    spare, demand = f.get("spare_capacity_mw"), f.get("demand_mw")
+    if spare is not None and demand and spare < 0.15 * demand:
+        reasons.append("there was very little spare generation left to call on")
+    change = f.get("demand_change_over_window_mw")
+    if change and demand and change > 0.05 * demand:
+        reasons.append("demand for electricity was climbing quickly")
+    s += "."
+    if reasons:
+        s += " " + reasons[0][0].upper() + reasons[0][1:] + "."
+        if len(reasons) > 1:
+            s += " On top of that, " + reasons[1] + "."   # keep it to the two most important causes
+    else:
+        s += " The full picture will be clearer once generators' price offers are published tomorrow."
+    return s
+
+
 SYSTEM_PROMPT = (
-    "You explain Australian National Electricity Market (NEM) price spikes to energy traders "
-    "and interested readers. Write 2–4 sentences in Australian English. Use ONLY the facts in "
-    "the JSON you are given. An interconnector with held_at_zero_by_constraint=true is being "
-    "held at zero flow by a constraint (often an outage), not running at full capacity. Do not speculate about causes that are not in the facts, do not "
-    "name generators or companies unless they appear in the facts, and do not invent numbers. "
-    "If bid_data_available is false, end by noting that bidding behaviour will be clearer once "
-    "AEMO publishes bids next morning. Times are AEST (market time). Plain text, no headings."
+    "You explain Australian electricity price spikes. You will be given facts as JSON about one 5-minute "
+    "price spike in the National Electricity Market. Write TWO explanations from ONLY those facts, and "
+    "return them as a JSON object with exactly two keys, \"technical\" and \"plain\", and nothing else.\n\n"
+    "\"technical\": for energy traders. At most 3 short sentences, under 70 words, like a sharp market "
+    "commentator. Sentence 1: the price and whether it jumped or eased versus price_5min_earlier (only say "
+    "'rose'/'jumped' if it is higher). Then the relevant drivers in the facts: demand moves, tight spare "
+    "capacity, interconnectors at their limit (at_limit=true), or interconnectors held at zero by a "
+    "constraint (held_at_zero_by_constraint=true, usually an outage). Constraint IDs and industry terms are "
+    "fine here. If bid_data_available is false, end with a short clause like 'bids due from AEMO tomorrow morning'.\n\n"
+    "\"plain\": for a member of the public with no energy background. At most 3 short sentences, under "
+    "60 words, at a year 9 reading level. Rules: no acronyms (no NEM, AEMO, MW, FCAS), no constraint codes "
+    "or IDs, no jargon. Say 'power lines between states' or 'power link' instead of interconnector, "
+    "'limits on the grid' instead of constraints, 'wholesale power price' instead of spot price or RRP. "
+    "Spell out state names. Write prices as dollars per megawatt hour and give a sense of scale: a typical "
+    "wholesale price is around $100 per megawatt hour, so say roughly how many times higher it was. Explain "
+    "the likely cause in everyday words using only the facts. Don't suggest household bills jumped by the "
+    "same amount.\n\n"
+    "For both: Australian English, don't repeat the date or time, don't name generators or companies, "
+    "don't invent numbers or causes that aren't in the facts. Plain text inside each value, no lists."
 )
 
 
-def claude_explanation(f: dict) -> tuple[str, str]:
+def _parse_two(text: str) -> tuple[str, str]:
+    import json
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        t = t[t.index("{"):] if "{" in t else t
+    t = t[t.index("{"): t.rindex("}") + 1]
+    obj = json.loads(t)
+    tech, plain = str(obj.get("technical", "")).strip(), str(obj.get("plain", "")).strip()
+    if not tech or not plain:
+        raise ValueError("missing technical or plain text")
+    return tech, plain
+
+
+def claude_explanations(f: dict) -> tuple[str, str, str]:
+    """Returns (technical, plain, model)."""
     import json
     model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-5-5")
     r = requests.post(
@@ -181,10 +253,10 @@ def claude_explanation(f: dict) -> tuple[str, str]:
         },
         json={
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 600,
             "thinking": {"type": "disabled"},   # we want a short direct answer, not reasoning tokens
             "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": "Explain this spike:\n" + json.dumps(f, indent=1)}],
+            "messages": [{"role": "user", "content": "Facts:\n" + json.dumps(f, indent=1)}],
         },
         timeout=60,
     )
@@ -196,7 +268,11 @@ def claude_explanation(f: dict) -> tuple[str, str]:
         kinds = [b.get("type") for b in data.get("content", [])]
         raise RuntimeError(f"no text from Anthropic API (stop_reason={data.get('stop_reason')}, "
                            f"blocks={kinds}, model={data.get('model')})")
-    return text, model
+    try:
+        tech, plain = _parse_two(text)
+    except Exception as e:
+        raise RuntimeError(f"couldn't read Claude's two explanations ({e}): {text[:200]}")
+    return tech, plain, model
 
 
 # ---------------------------------------------------------------- main entry
@@ -206,6 +282,23 @@ def detect_spikes(prices: list[dict]) -> list[dict]:
     return [p for p in prices if p.get("rrp") is not None and p["rrp"] >= th]
 
 
+def explain_facts(facts: dict, use_ai: bool) -> dict:
+    """Technical + plain explanations for one spike's facts, Claude if allowed, else templates."""
+    out = {
+        "explanation": template_explanation(facts),
+        "explanation_plain": plain_template_explanation(facts),
+        "explanation_source": "template",
+        "model": None,
+    }
+    if use_ai:
+        try:
+            tech, plain, model = claude_explanations(facts)
+            out.update(explanation=tech, explanation_plain=plain, explanation_source="claude", model=model)
+        except Exception as e:
+            print(f"  ! Claude explanation failed, using templates: {e}")
+    return out
+
+
 def explain_new_spikes(new_spikes, prices, ics, cons) -> list[dict]:
     use_ai = bool(os.environ.get("ANTHROPIC_API_KEY"))
     ai_budget = int(os.environ.get("MAX_AI_PER_RUN", "10"))
@@ -213,21 +306,14 @@ def explain_new_spikes(new_spikes, prices, ics, cons) -> list[dict]:
     # explain the newest spikes first so the live feed gets AI text if the budget runs out
     for sp in sorted(new_spikes, key=lambda p: p["interval_end"], reverse=True):
         facts = build_facts(sp, prices, ics, cons)
-        text, source, model = template_explanation(facts), "template", None
-        if use_ai and ai_budget > 0:
-            try:
-                text, model = claude_explanation(facts)
-                source = "claude"
-                ai_budget -= 1
-            except Exception as e:
-                print(f"  ! Claude explanation failed, using template: {e}")
+        ex = explain_facts(facts, use_ai and ai_budget > 0)
+        if ex["explanation_source"] == "claude":
+            ai_budget -= 1
         rows.append({
             "interval_end": sp["interval_end"],
             "region": sp["region"],
             "rrp": sp["rrp"],
             "facts": facts,
-            "explanation": text,
-            "explanation_source": source,
-            "model": model,
+            **ex,
         })
     return rows
